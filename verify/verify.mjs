@@ -236,6 +236,65 @@ const req = (buf, extra = {}) => ({ ...T, pcapBase64: b64(buf), ...extra });
   eq('tcp: 相同 SYN 重传接受', analyze(req(pcap(synRetx))).streamLength, L);
 }
 
+// ---------- 5b. 重传/分片完整归因（先到包不得被后到重传隐藏） ----------
+{
+  const s = makeSession({ commands: ['AAA', 'BBBB', 'CCCCC'] }); // 帧 5+6+7 = 18 字节
+  const L = s.stream.length;
+
+  // 1) 一条完整指令先由 #2 送达，随后 #3 是序号与内容完全相同的重传：
+  //    通过结论保留，指令一 [0,5) 必须同时列出 #2 与 #3 及各自区间
+  const dup = pcap([s.syn(), s.data(0, 5), s.data(0, 5), s.data(5, 13), s.fin(L)]);
+  const rd = analyze(req(dup));
+  eq('归因: 完全相同重传仍判定有效', rd.commands.map((c) => c.text), ['AAA', 'BBBB', 'CCCCC']);
+  eq('归因: 完全重传指令一包号含先到包与重传包', rd.commands[0].packets, [2, 3]);
+  eq('归因: 完全重传指令一各自区间', rd.commands[0].packetRanges, [
+    { packet: 2, byteRange: [0, 5] },
+    { packet: 3, byteRange: [0, 5] },
+  ]);
+  eq('归因: 未重传指令二仅列 #4', rd.commands[1].packets, [4]);
+  eq('归因: 未重传指令三仅列 #4', rd.commands[2].packets, [4]);
+
+  // 2) 部分重叠重传：#2 [0,9)，#3 [6,15)（[6,9) 为相同字节重传），#4 [15,18)
+  const part = pcap([s.syn(), s.data(0, 9), s.data(6, 9), s.data(15, 3), s.fin(L)]);
+  const rp = analyze(req(part));
+  eq('归因: 部分重叠指令一仅由 #2 承载', rp.commands[0].packets, [2]);
+  eq('归因: 部分重叠指令二区间（两个包各一段）', rp.commands[1].packetRanges, [
+    { packet: 2, byteRange: [5, 9] },
+    { packet: 3, byteRange: [6, 11] },
+  ]);
+  eq('归因: 部分重叠指令二包号', rp.commands[1].packets, [2, 3]);
+  eq('归因: 部分重叠指令三区间', rp.commands[2].packetRanges, [
+    { packet: 3, byteRange: [11, 15] },
+    { packet: 4, byteRange: [15, 18] },
+  ]);
+
+  // 3) 指令经 IP 分片承载，且其中一片有完全相同的重传片：归属同时列出两个片包号
+  //    包号：SYN=#1，f0=#2，f1=#3，f2=#4，f2重传=#5，f3=#6，f4=#7，FIN=#8
+  const sf = makeSession({ commands: ['NAV FIX A1', 'HOLD'] }); // 12+6 = 18 字节
+  const seg = tcp({ sport: sf.sport, dport: sf.dport, seq: sf.dataStart, flags: 0x18, data: sf.stream });
+  const frags = fragmentPayload({ srcIp: sf.srcIp, dstIp: sf.dstIp, id: 0x7777, payload: seg, chunkSize: 8 });
+  const capF = pcap([sf.syn(), frags[0], frags[1], frags[2], frags[2], frags[3], frags[4], sf.fin(18)]);
+  const rf = analyze(req(capF));
+  eq('归因: 分片+重传片指令一包号', rf.commands[0].packets, [4, 5, 6]);
+  eq('归因: 分片+重传片指令一区间', rf.commands[0].packetRanges, [
+    { packet: 4, byteRange: [0, 4] },
+    { packet: 5, byteRange: [0, 4] },
+    { packet: 6, byteRange: [4, 12] },
+  ]);
+  eq('归因: 分片指令二仅列末片', rf.commands[1].packets, [7]);
+
+  // 4) 32 位回绕边界的重传归因：ISN=0xFFFFFFFE，首段跨回绕点且被完全相同重传
+  const w = makeSession({ isn: 0xfffffffe, commands: ['WRAP TEST'] }); // 11 字节
+  const capW = pcap([w.syn(), w.data(0, 4), w.data(0, 4), w.data(4, 7), w.fin(11)]);
+  const rw = analyze(req(capW));
+  eq('归因: 回绕重传指令包号', rw.commands[0].packets, [2, 3, 4]);
+  eq('归因: 回绕重传指令区间', rw.commands[0].packetRanges, [
+    { packet: 2, byteRange: [0, 4] },
+    { packet: 3, byteRange: [0, 4] },
+    { packet: 4, byteRange: [4, 11] },
+  ]);
+}
+
 // ---------- 6. 指令格式 ----------
 {
   // 尾随残字节（1 字节）
@@ -415,6 +474,14 @@ const req = (buf, extra = {}) => ({ ...T, pcapBase64: b64(buf), ...extra });
           && r.streamLength === spec.streamLength && r.packetCount === spec.packetCount;
         ok('冒烟: good 样例指令/包号/长度全部符合', smokeOk === 1,
           JSON.stringify(r.commands.map((c) => c.text)));
+        // 每条指令的全部承载包号与各自流内半开区间必须可复算（重传/分片一个不落）
+        const attrOk = r.commands.every((c, i) => {
+          const want = spec.commands[i];
+          return JSON.stringify(c.packets) === JSON.stringify(want.packets)
+            && JSON.stringify(c.packetRanges) === JSON.stringify(want.packetRanges);
+        });
+        ok('冒烟: good 样例逐指令承载包号与区间完整可复算', attrOk,
+          JSON.stringify(r.commands.map((c) => c.packetRanges)));
       } else {
         try {
           analyze(input);

@@ -64,6 +64,31 @@ await mkdir(OUT, { recursive: true });
 await writeFile(path.join(OUT, 'good.pcap.b64'), good.toString('base64') + '\n');
 await writeFile(path.join(OUT, 'conflict.pcap.b64'), conflict.toString('base64') + '\n');
 
+// good 样例的逐包归因期望（手工推算，与生成代码相互独立，供 verify 冒烟复算比对）：
+// 流内承载：#4=frag2→[0,4)  #8=frag3→[4,12)  #6=frag4→[12,16)  #9→[16,32)  #11→[32,48)
+// 重传叠加：#10→[8,16)  #12→[24,40)；4 条指令各占 12 字节（2 前缀 + 10 载荷）。
+const GOOD_ATTRIBUTION = [
+  { byteRange: [0, 12], packets: [4, 8, 10], packetRanges: [
+    { packet: 4, byteRange: [0, 4] },
+    { packet: 8, byteRange: [4, 12] },
+    { packet: 10, byteRange: [8, 12] },
+  ] },
+  { byteRange: [12, 24], packets: [6, 9, 10], packetRanges: [
+    { packet: 6, byteRange: [12, 16] },
+    { packet: 9, byteRange: [16, 24] },
+    { packet: 10, byteRange: [12, 16] },
+  ] },
+  { byteRange: [24, 36], packets: [9, 11, 12], packetRanges: [
+    { packet: 9, byteRange: [24, 32] },
+    { packet: 11, byteRange: [32, 36] },
+    { packet: 12, byteRange: [24, 36] },
+  ] },
+  { byteRange: [36, 48], packets: [11, 12], packetRanges: [
+    { packet: 11, byteRange: [36, 48] },
+    { packet: 12, byteRange: [36, 40] },
+  ] },
+];
+
 const manifest = {
   tuple: TUPLE,
   isn: ISN >>> 0,
@@ -73,7 +98,7 @@ const manifest = {
     synPacket: 2,
     finPacket: 13,
     streamLength: COMMANDS.reduce((n, c) => n + 2 + c.length, 0),
-    commands: COMMANDS.map((text, i) => ({ index: i, text })),
+    commands: COMMANDS.map((text, i) => ({ index: i, text, ...GOOD_ATTRIBUTION[i] })),
   },
   conflict: {
     file: 'conflict.pcap.b64',
