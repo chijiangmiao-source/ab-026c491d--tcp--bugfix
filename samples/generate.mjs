@@ -29,9 +29,10 @@ function buildGood() {
   frames.push(s.data(16, 16));                   // #9 流 [16,32)，越过 0xFFFFFFFF 回绕
   frames.push(s.data(8, 8));                     // #10 同字节重传 [8,16)
   frames.push(s.data(32, 16));                   // #11 回绕后 [32,48)
-  frames.push(s.data(24, 16));                   // #12 同字节重传 [24,40)，跨两段
-  frames.push(s.fin(48));                        // #13 FIN
-  frames.push(s.serverFin());                    // #14 反向 FIN
+  frames.push(s.data(24, 16));                   // #12 同字节重传 [24,40)，跨两段（部分重叠）
+  frames.push(s.data(0, 12));                    // #13 整条指令一（[0,12)）的完全相同重传，单包承载
+  frames.push(s.fin(48));                        // #14 FIN
+  frames.push(s.serverFin());                    // #15 反向 FIN
   return pcap(frames);
 }
 
@@ -52,9 +53,10 @@ function buildConflict() {
   frames.push(s.data(16, 16));                   // #9 持有原始偏移 30
   frames.push(s.data(8, 8));                     // #10 正常重传
   frames.push(s.data(32, 16));                   // #11
-  frames.push(s.data(24, 16, { data: tampered }));// #12 同序号、字节冲突
-  frames.push(s.fin(48));                        // #13
-  frames.push(s.serverFin());                    // #14
+  frames.push(s.data(0, 12));                    // #12 整条指令一的完全相同重传（与冲突无关）
+  frames.push(s.data(24, 16, { data: tampered }));// #13 同序号、字节冲突
+  frames.push(s.fin(48));                        // #14
+  frames.push(s.serverFin());                    // #15
   return pcap(frames);
 }
 
@@ -69,17 +71,57 @@ const manifest = {
   isn: ISN >>> 0,
   good: {
     file: 'good.pcap.b64',
-    packetCount: 14,
+    packetCount: 15,
     synPacket: 2,
-    finPacket: 13,
+    finPacket: 14,
     streamLength: COMMANDS.reduce((n, c) => n + 2 + c.length, 0),
-    commands: COMMANDS.map((text, i) => ({ index: i, text })),
+    // 每条指令必须列出“全部”实际承载其字节的原始包号及各自流内半开区间，
+    // 含完全相同重传（#13）、部分重叠重传（#10/#12）与 IP 分片（#4..#8）。
+    commands: [
+      {
+        index: 0, text: 'NAV FIX A1',
+        packets: [4, 8, 10, 13],
+        packetRanges: [
+          { packet: 4, byteRange: [0, 4] },
+          { packet: 8, byteRange: [4, 12] },
+          { packet: 10, byteRange: [8, 12] },
+          { packet: 13, byteRange: [0, 12] },
+        ],
+      },
+      {
+        index: 1, text: 'THR 87 PCT',
+        packets: [6, 9, 10],
+        packetRanges: [
+          { packet: 6, byteRange: [12, 16] },
+          { packet: 9, byteRange: [16, 24] },
+          { packet: 10, byteRange: [12, 16] },
+        ],
+      },
+      {
+        index: 2, text: 'HOLD LEVEL',
+        packets: [9, 11, 12],
+        packetRanges: [
+          { packet: 9, byteRange: [24, 32] },
+          { packet: 11, byteRange: [32, 36] },
+          { packet: 12, byteRange: [24, 36] },
+        ],
+      },
+      {
+        index: 3, text: 'CHK 0x4F2A',
+        packets: [11, 12],
+        packetRanges: [
+          { packet: 11, byteRange: [36, 48] },
+          { packet: 12, byteRange: [36, 40] },
+        ],
+      },
+    ],
   },
   conflict: {
     file: 'conflict.pcap.b64',
+    packetCount: 15,
     code: 'CONFLICT',
     packet: 9,
-    packet2: 12,
+    packet2: 13,
     offset: 30,
     range: [30, 31],
   },

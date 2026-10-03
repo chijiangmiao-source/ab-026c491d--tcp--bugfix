@@ -47,8 +47,16 @@ function renderError(err) {
 }
 
 function formatPacketRanges(command) {
-  return command.packetRanges
-    .map((entry) => '#' + entry.packet + ' [' + entry.byteRange[0] + ', ' + entry.byteRange[1] + ')')
+  // 同一原始包号在指令内可能承载多段不相邻字节（部分重叠/乱序重传），按包号归组展示
+  const byPacket = new Map();
+  for (const entry of command.packetRanges) {
+    const ranges = byPacket.get(entry.packet) || [];
+    ranges.push('[' + entry.byteRange[0] + ', ' + entry.byteRange[1] + ')');
+    byPacket.set(entry.packet, ranges);
+  }
+  return [...byPacket.keys()]
+    .sort((a, b) => a - b)
+    .map((pkt) => '#' + pkt + ' ' + byPacket.get(pkt).join(' '))
     .join('<br>');
 }
 
@@ -78,7 +86,7 @@ function renderOk(r) {
           <th>#</th><th>重建指令（ASCII）</th><th>载荷长度</th>
           <th class="mono">流内字节区间[起,止)<br><span style="font-weight:400">含 2 字节长度前缀</span></th>
           <th class="mono">载荷区间[起,止)</th>
-          <th>对应原始包号</th>
+          <th>承载该指令的全部原始包号<br><span style="font-weight:400">包号 → 流内半开区间[起,止)（含相同重传）</span></th>
         </tr>
       </thead>
       <tbody>${rows}</tbody>

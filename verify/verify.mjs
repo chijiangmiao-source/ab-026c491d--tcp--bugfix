@@ -327,6 +327,111 @@ const req = (buf, extra = {}) => ({ ...T, pcapBase64: b64(buf), ...extra });
   eq('结构: 流长度', r.streamLength, 19);
 }
 
+// ---------- 9b. 有效重传的“包号—流内半开区间”完整归因（审计可复算）----------
+{
+  // 不变量：一条指令的全部承载区间的并集必须恰好等于该指令流内区间（每个字节至少被
+  // 一个真实原始包承载），区间均为非空半开、落在指令边界内，且包号升序、无重复项。
+  function coverageComplete(c) {
+    const [c0, c1] = c.byteRange;
+    const cover = new Array(c1 - c0).fill(false);
+    let wellFormed = Array.isArray(c.packets);
+    for (const entry of c.packetRanges) {
+      const [lo, hi] = entry.byteRange;
+      if (!Number.isInteger(entry.packet) || lo < c0 || hi > c1 || lo >= hi) { wellFormed = false; continue; }
+      for (let i = lo; i < hi; i++) cover[i - c0] = true;
+    }
+    const packetsFromRanges = [...new Set(c.packetRanges.map((e) => e.packet))].sort((a, b) => a - b);
+    return wellFormed
+      && cover.every(Boolean)
+      && JSON.stringify(packetsFromRanges) === JSON.stringify(c.packets);
+  }
+
+  // A. 一条完整指令先由一个数据段送达，随后收到“序号与内容完全相同”的重传：
+  //    通过结论中先到包与重传包都必须列出，且各自覆盖整条指令区间。
+  {
+    const s = makeSession({ commands: ['NAV FIX A1'] }); // 12 字节
+    const r = analyze(req(pcap([s.syn(), s.data(0, 12), s.data(0, 12), s.fin(12)])));
+    const c = r.commands[0];
+    eq('归因A: 先到包与重传包均列出', c.packets, [2, 3]);
+    eq('归因A: 两包各自覆盖整条指令区间', c.packetRanges, [
+      { packet: 2, byteRange: [0, 12] },
+      { packet: 3, byteRange: [0, 12] },
+    ]);
+    ok('归因A: 区间并集恰好覆盖指令且可复算', coverageComplete(c));
+  }
+
+  // B. 部分重叠重传 + 乱序段：每个实际承载字节的包都要出现（同一包可有多段区间）。
+  {
+    const s = makeSession({ commands: ['AAA', 'BBBB', 'CCCCC'] }); // 18 字节
+    const r = analyze(req(pcap([s.syn(), s.data(0, 9), s.data(6, 9), s.data(0, 12), s.data(12, 6), s.fin(18)])));
+    eq('归因B: 指令一承载包（含完整重叠重传）', r.commands[0].packets, [2, 4]);
+    eq('归因B: 指令一各包区间', r.commands[0].packetRanges, [
+      { packet: 2, byteRange: [0, 5] },
+      { packet: 4, byteRange: [0, 5] },
+    ]);
+    eq('归因B: 指令二承载包（部分重叠三段）', r.commands[1].packets, [2, 3, 4]);
+    eq('归因B: 指令二各包区间', r.commands[1].packetRanges, [
+      { packet: 2, byteRange: [5, 9] },
+      { packet: 3, byteRange: [6, 11] },
+      { packet: 4, byteRange: [5, 11] },
+    ]);
+    eq('归因B: 指令三承载包', r.commands[2].packets, [3, 4, 5]);
+    ok('归因B: 三条指令区间并集均完整可复算', r.commands.every(coverageComplete));
+  }
+
+  // C. IP 分片承载指令 + 同偏移同字节分片重传：碎片包与重传碎片包都要保留。
+  {
+    const s = makeSession({ commands: ['NAV FIX A1', 'HOLD'] }); // 18 字节
+    const seg = tcp({ sport: s.sport, dport: s.dport, seq: s.dataStart, flags: 0x18, data: s.stream });
+    const frags = fragmentPayload({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x7100, payload: seg, chunkSize: 8 });
+    // seg[24..32)（offset=3）承载流字节 [4,12)，构造其完全相同的重传碎片（包 #7）
+    const dupFrag = ipFragment({
+      srcIp: s.srcIp, dstIp: s.dstIp, id: 0x7100, part: seg.subarray(24, 32), offset: 3, mf: true,
+    });
+    const r = analyze(req(pcap([s.syn(), ...frags, dupFrag, s.fin(18)])));
+    eq('归因C: 指令一列出碎片与重传碎片包', r.commands[0].packets, [4, 5, 7]);
+    eq('归因C: 指令一各包区间（重传碎片覆盖 [4,12)）', r.commands[0].packetRanges, [
+      { packet: 4, byteRange: [0, 4] },
+      { packet: 5, byteRange: [4, 12] },
+      { packet: 7, byteRange: [4, 12] },
+    ]);
+    eq('归因C: 指令二仅由末片承载', r.commands[1].packets, [6]);
+    ok('归因C: 分片指令区间并集完整可复算', r.commands.every(coverageComplete));
+
+    // 回归：同一位置的重传分片若字节不同，仍必须 FRAGMENT_CONFLICT 拒绝，不得任选其一
+    const evilPart = Buffer.from(seg.subarray(24, 32));
+    evilPart[0] ^= 0x5a;
+    const evilFrag = ipFragment({
+      srcIp: s.srcIp, dstIp: s.dstIp, id: 0x7100, part: evilPart, offset: 3, mf: true,
+    });
+    expectCode('归因C: 异字节重叠分片拒绝',
+      () => analyze(req(pcap([s.syn(), ...frags, evilFrag, s.fin(18)]))), 'FRAGMENT_CONFLICT');
+  }
+
+  // D. 32 位序号回绕后的相同字节重传：回绕两侧承载包同样完整归因。
+  {
+    const w = makeSession({ isn: 0xfffffffe, commands: ['WRAP TEST'] }); // 11 字节
+    const r = analyze(req(pcap([w.syn(), w.data(0, 4), w.data(4, 7), w.data(2, 9), w.fin(11)])));
+    eq('归因D: 回绕重传下列出全部承载包', r.commands[0].packets, [2, 3, 4]);
+    eq('归因D: 各包区间', r.commands[0].packetRanges, [
+      { packet: 2, byteRange: [0, 4] },
+      { packet: 3, byteRange: [4, 11] },
+      { packet: 4, byteRange: [2, 11] },
+    ]);
+    ok('归因D: 区间并集完整可复算', coverageComplete(r.commands[0]));
+  }
+
+  // 回归：完整相同重传保留通过结论的同时，异字节覆盖仍必须 CONFLICT（定位不被归因补全影响）。
+  {
+    const s = makeSession({ commands: ['NAV FIX A1'] });
+    const bad = Buffer.from(s.stream.subarray(0, 12));
+    bad[5] ^= 0xff;
+    expectCode('归因回归: 完全重叠但异字节仍拒绝',
+      () => analyze(req(pcap([s.syn(), s.data(0, 12), s.data(0, 12, { data: bad }), s.fin(12)]))),
+      'CONFLICT');
+  }
+}
+
 // ---------- 10. 页面构建 ----------
 {
   const htmlPath = path.join(ROOT, 'public', 'index.html');
@@ -384,7 +489,6 @@ const req = (buf, extra = {}) => ({ ...T, pcapBase64: b64(buf), ...extra });
     throw new Error(`server at ${base} never became ready`);
   }
 
-  let smokeOk = 0;
   try {
     await waitReady();
     const h = await fetch(`${base}/healthz`);
@@ -409,12 +513,21 @@ const req = (buf, extra = {}) => ({ ...T, pcapBase64: b64(buf), ...extra });
       const input = { ...manifest.tuple, pcapBase64: b64Text };
       if (kind === 'good') {
         const r = analyze(input);
-        smokeOk += r.commands.length === spec.commands.length
-          && r.commands.every((c, i) => c.text === spec.commands[i].text)
-          && r.synPacket === spec.synPacket && r.finPacket === spec.finPacket
+        const commandsOk = r.commands.length === spec.commands.length
+          && r.commands.every((c, i) => {
+            const e = spec.commands[i];
+            return c.text === e.text
+              && JSON.stringify(c.packets) === JSON.stringify(e.packets)
+              && JSON.stringify(c.packetRanges) === JSON.stringify(e.packetRanges);
+          });
+        const headOk = r.synPacket === spec.synPacket && r.finPacket === spec.finPacket
           && r.streamLength === spec.streamLength && r.packetCount === spec.packetCount;
-        ok('冒烟: good 样例指令/包号/长度全部符合', smokeOk === 1,
-          JSON.stringify(r.commands.map((c) => c.text)));
+        ok('冒烟: good 样例指令/包号/区间/长度全部符合', commandsOk && headOk,
+          commandsOk
+            ? '指令承载归因符合'
+            : JSON.stringify(r.commands.map((c) => ({
+              text: c.text, packets: c.packets, packetRanges: c.packetRanges,
+            }))));
       } else {
         try {
           analyze(input);
